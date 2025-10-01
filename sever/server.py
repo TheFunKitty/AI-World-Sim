@@ -1,156 +1,116 @@
-import socket
-import threading
-import json
-import time
-import os
+import socket, threading, json, yaml, time, os, requests
 
 HOST = "0.0.0.0"
 PORT = 6000
-TICK_INTERVAL = 1.0  # seconds between broadcasts
-MAP_FILE = "1.map"
 
-lock = threading.Lock()
-clients = {}   # name -> {'conn': socket, 'addr': addr}
-players = {}   # name -> state dict {x,y,z,h,p,color,hp,ts}
+players = {}  # conn -> player dict
+clients = []
 
-def load_map():
-    if not os.path.exists(MAP_FILE):
-        default = [
-            "############",
-            "#..........#",
-            "#..~~..##..#",
-            "#..~~......#",
-            "#......##..#",
-            "#..##......#",
-            "#..........#",
-            "############",
-        ]
-        with open(MAP_FILE, "w") as f:
-            f.write("\n".join(default))
-    with open(MAP_FILE, "r") as f:
-        return [line.rstrip("\n") for line in f.readlines()]
+# --- Map manager integrated ---
+def ensure_map(map_name, maps_folder="maps"):
+    os.makedirs(maps_folder, exist_ok=True)
+    map_path = os.path.join(maps_folder, map_name)
 
-WORLD_MAP = load_map()
+    if not os.path.exists(map_path):
+        print(f"Map {map_name} not found locally.")
+        url = input(f"Enter download link for {map_name} (or 'pass' to skip): ")
+        if url.strip().lower() != "pass":
+            r = requests.get(url)
+            if r.status_code == 200:
+                with open(map_path, "wb") as f:
+                    f.write(r.content)
+                print(f"Downloaded {map_name} to {map_path}")
+            else:
+                raise RuntimeError(f"Failed to download {map_name}: {r.status_code}")
+        else:
+            print(f"Skipping download of {map_name}.")
+    return map_path
 
-def safe_send(conn, bts):
-    try:
-        conn.sendall(bts)
-        return True
-    except Exception:
-        return False
+MAP_NAME = "1.map"
+map_path = ensure_map(MAP_NAME)
+
+# --- write YAML config ---
+server_config = {
+    "server": {"ip": HOST, "port": PORT},
+    "gameplay": {"max_hp": 100, "damage": 20, "respawn_time": 5},
+    "map": MAP_NAME
+}
+with open("server_config.yaml", "w") as f:
+    yaml.dump(server_config, f)
+
 
 def handle_client(conn, addr):
-    conn_file = conn.makefile("r")
-    name = None
+    print(f"Client {addr} connected")
+    clients.append(conn)
+    players[conn] = {"pos": [0, 0, 0], "color": [1, 1, 1, 1], "hp": 100, "alive": True}
+
     try:
-        # Expect first line to be player name
-        raw = conn_file.readline()
-        if not raw:
-            conn.close(); return
-        name = raw.strip()
-        if not name:
-            conn.close(); return
-
-        with lock:
-            clients[name] = {'conn': conn, 'addr': addr}
-            players[name] = {'x': 1.0, 'y': 1.0, 'z': 1.5, 'h': 0.0, 'p': 0.0,
-                             'color': '#ff0000', 'hp': 100, 'ts': time.time()}
-
-        print(f"[connect] {name} @ {addr}")
-
-        # Send the map once on connect (clients may ignore if they load local map)
-        try:
-            map_msg = {"type": "map", "payload": {"map": WORLD_MAP}}
-            conn.sendall((json.dumps(map_msg) + "\n").encode())
-        except Exception:
-            pass
-
-        # Read JSON lines from client. Clients will periodically send position snapshots.
+        buf = ""
         while True:
-            line = conn_file.readline()
-            if not line:
+            data = conn.recv(1024)
+            if not data:
                 break
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except Exception:
-                continue
-            if obj.get("type") == "pos":
-                payload = obj.get("payload", {})
-                with lock:
-                    st = players.get(name, {})
-                    try:
-                        st['x'] = float(payload.get("x", st.get('x', 1.0)))
-                        st['y'] = float(payload.get("y", st.get('y', 1.0)))
-                        st['z'] = float(payload.get("z", st.get('z', 1.5)))
-                        st['h'] = float(payload.get("h", st.get('h', 0.0)))
-                        st['p'] = float(payload.get("p", st.get('p', 0.0)))
-                        st['color'] = str(payload.get("color", st.get('color', '#ff0000')))
-                        st['hp'] = int(payload.get("hp", st.get('hp', 100)))
-                        st['ts'] = time.time()
-                        players[name] = st
-                    except Exception:
-                        pass
-            # ignore other message types
-
-    except Exception as e:
-        print("client handler exception:", e)
+            buf += data.decode()
+            while "\n" in buf:
+                line, buf = buf.split("\n", 1)
+                if not line.strip():
+                    continue
+                msg = json.loads(line)
+                if msg["type"] == "update":
+                    players[conn]["pos"] = msg["pos"]
+                elif msg["type"] == "shoot":
+                    target_id = msg.get("target")
+                    dmg = server_config["gameplay"]["damage"]
+                    for c, pdata in players.items():
+                        if id(c) == target_id and pdata["alive"]:
+                            pdata["hp"] -= dmg
+                            if pdata["hp"] <= 0:
+                                pdata["hp"] = 0
+                                pdata["alive"] = False
     finally:
-        with lock:
-            if name:
-                print(f"[disconnect] {name}")
-                clients.pop(name, None)
-                players.pop(name, None)
-        try:
-            conn.close()
-        except:
-            pass
+        print(f"Client {addr} disconnected")
+        if conn in clients:
+            clients.remove(conn)
+        if conn in players:
+            players.pop(conn, None)
+        conn.close()
+
+
+def players_state():
+    return {
+        str(id(c)): {
+            "pos": pdata["pos"],
+            "color": pdata["color"],
+            "hp": pdata["hp"],
+            "alive": pdata["alive"]
+        }
+        for c, pdata in players.items()
+    }
+
 
 def broadcast_loop():
     while True:
-        time.sleep(TICK_INTERVAL)
-        with lock:
-            snapshot = {
-                "type": "state",
-                "payload": {
-                    "players": players,
-                    "t": time.time()
-                }
-            }
-            raw = (json.dumps(snapshot) + "\n").encode()
-            dead = []
-            for name, info in list(clients.items()):
-                conn = info['conn']
-                ok = safe_send(conn, raw)
-                if not ok:
-                    dead.append(name)
-            for d in dead:
-                print(f"[cleanup] removing {d}")
-                clients.pop(d, None)
-                players.pop(d, None)
+        if clients:
+            msg = {"type": "update", "players": players_state()}
+            packet = (json.dumps(msg) + "\n").encode()
+            for c in list(clients):
+                try:
+                    c.sendall(packet)
+                except:
+                    pass
+        time.sleep(1)
+
 
 def main():
-    print("Loading map from", MAP_FILE)
-    print("Map size:", len(WORLD_MAP), "rows")
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((HOST, PORT))
-    server.listen(32)
-    print(f"Server listening on {HOST}:{PORT} (LAN)")
-
     threading.Thread(target=broadcast_loop, daemon=True).start()
-
-    try:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((HOST, PORT))
+        s.listen()
+        print(f"Server running on {HOST}:{PORT} with map {MAP_NAME}")
         while True:
-            conn, addr = server.accept()
-            t = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
-            t.start()
-    except KeyboardInterrupt:
-        print("Server shutting down...")
-    finally:
-        server.close()
+            conn, addr = s.accept()
+            threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+
 
 if __name__ == "__main__":
     main()
